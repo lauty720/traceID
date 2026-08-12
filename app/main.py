@@ -20,13 +20,12 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 
-_origins = settings.cors_origins_list
-_allow_creds = "*" not in _origins
+# CORS abierto para Netlify + cualquier origen (proyecto educativo)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_origins if _allow_creds else ["*"],
-    allow_credentials=_allow_creds,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 

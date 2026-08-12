@@ -1,5 +1,6 @@
 import os
 import uuid
+import asyncio
 import aiofiles
 from pathlib import Path
 from typing import Optional
@@ -29,12 +30,28 @@ def _ensure_upload_dir():
 
 
 async def _cleanup_file(path: str):
-    """Delete temporary file after analysis."""
     try:
         if path and os.path.exists(path):
             os.remove(path)
     except Exception:
         pass
+
+
+def _compress_image(content: bytes, max_side: int = 1280, quality: int = 82) -> bytes:
+    try:
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open(BytesIO(content))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        w, h = img.size
+        if max(w, h) > max_side:
+            img.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return content
 
 
 @router.get("/health")
@@ -57,11 +74,6 @@ async def analyze_image(
     file: Optional[UploadFile] = File(None),
     demo: Optional[bool] = False,
 ):
-    """
-    Main analysis endpoint.
-    Coordinates AI detection, reverse search, public footprint and report generation.
-    When demo=true (or system is in demo mode) returns fictional data without requiring a valid image.
-    """
     use_demo = bool(demo) or settings.is_demo_mode or settings.FORCE_DEMO_MODE
 
     _ensure_upload_dir()
@@ -70,7 +82,6 @@ async def analyze_image(
     content = None
 
     if use_demo:
-        # Demo: file is optional. If provided and valid we still accept it for seed variety.
         if file and file.filename:
             try:
                 await validate_image(file)
@@ -82,13 +93,11 @@ async def analyze_image(
                     await f.write(content)
                 background_tasks.add_task(_cleanup_file, file_path)
             except Exception:
-                pass  # invalid file in demo is fine
-
+                pass
         result = generate_demo_analysis(seed=unique_name)
         result["is_demo"] = True
         return JSONResponse(content=result)
 
-    # --- Real pipeline: image is required ---
     if file is None or not file.filename:
         raise HTTPException(status_code=400, detail="Se requiere una imagen para el análisis.")
 
@@ -96,17 +105,39 @@ async def analyze_image(
     original_name = sanitize_filename(file.filename or "image.jpg")
     unique_name = f"{uuid.uuid4().hex}_{original_name}"
     file_path = os.path.join(settings.UPLOAD_DIR, unique_name)
-    content = await file.read()
+    raw = await file.read()
+    content = _compress_image(raw)
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
     background_tasks.add_task(_cleanup_file, file_path)
 
     try:
-        image_analysis = await detect_ai_content(file_path, content)
-        reverse_result = await reverse_image_search(file_path, content)
+        image_analysis, reverse_result = await asyncio.gather(
+            detect_ai_content(file_path, content),
+            reverse_image_search(file_path, content),
+            return_exceptions=True,
+        )
+
+        if isinstance(image_analysis, Exception):
+            print(f"[Analyze] AI detector error: {image_analysis}")
+            image_analysis = {
+                "ai_probability": 0,
+                "confidence": "low",
+                "explanation": "No se pudo completar la detección de IA a tiempo. Reintentá más tarde.",
+                "warning": "Resultado parcial por timeout o error del proveedor.",
+            }
+        if isinstance(reverse_result, Exception):
+            print(f"[Analyze] Reverse search error: {reverse_result}")
+            reverse_result = {
+                "matches_found": 0,
+                "sources": [],
+                "note": "La búsqueda inversa no respondió a tiempo. Esto no implica que la imagen sea original.",
+            }
+
         footprint = await analyze_public_footprint(reverse_result, file_path)
         consistency = compute_consistency(reverse_result, footprint)
         evidence = compute_evidence_score(image_analysis, reverse_result, footprint, consistency)
+
         report = await generate_analysis_report(
             image_analysis, reverse_result, footprint, consistency, evidence
         )
@@ -135,7 +166,7 @@ async def analyze_image(
                     "message": "No se encontraron coincidencias indexadas. Esto no implica que la imagen sea original.",
                 })
 
-        result = {
+        return JSONResponse(content={
             "is_demo": False,
             "image_analysis": image_analysis,
             "reverse_search": reverse_result,
@@ -144,8 +175,7 @@ async def analyze_image(
             "evidence_score": evidence,
             "summary": report.get("summary", ""),
             "warnings": warnings,
-        }
-        return JSONResponse(content=result)
+        })
 
     except HTTPException:
         raise
@@ -159,66 +189,47 @@ async def analyze_image(
 
 @router.post("/detect-ai")
 @limiter.limit(settings.RATE_LIMIT)
-async def detect_ai_only(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-):
+async def detect_ai_only(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     await validate_image(file)
     _ensure_upload_dir()
     unique_name = f"{uuid.uuid4().hex}_{sanitize_filename(file.filename or 'img.jpg')}"
     file_path = os.path.join(settings.UPLOAD_DIR, unique_name)
-    content = await file.read()
+    content = _compress_image(await file.read())
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
     background_tasks.add_task(_cleanup_file, file_path)
-
     if settings.is_demo_mode:
-        demo = generate_demo_analysis(seed=unique_name)
-        return demo["image_analysis"]
-
-    result = await detect_ai_content(file_path, content)
-    return result
+        return generate_demo_analysis(seed=unique_name)["image_analysis"]
+    return await detect_ai_content(file_path, content)
 
 
 @router.post("/reverse-search")
 @limiter.limit(settings.RATE_LIMIT)
-async def reverse_search_only(
-    request: Request,
-    background_tasks: BackgroundTasks,
-    file: UploadFile = File(...),
-):
+async def reverse_search_only(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     await validate_image(file)
     _ensure_upload_dir()
     unique_name = f"{uuid.uuid4().hex}_{sanitize_filename(file.filename or 'img.jpg')}"
     file_path = os.path.join(settings.UPLOAD_DIR, unique_name)
-    content = await file.read()
+    content = _compress_image(await file.read())
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
     background_tasks.add_task(_cleanup_file, file_path)
-
     if settings.is_demo_mode:
-        demo = generate_demo_analysis(seed=unique_name)
-        return demo["reverse_search"]
-
-    result = await reverse_image_search(file_path, content)
-    return result
+        return generate_demo_analysis(seed=unique_name)["reverse_search"]
+    return await reverse_image_search(file_path, content)
 
 
 @router.post("/analyze-public-footprint")
 async def footprint_endpoint(payload: dict):
-    reverse_result = payload.get("reverse_search", {})
-    result = await analyze_public_footprint(reverse_result)
-    return result
+    return await analyze_public_footprint(payload.get("reverse_search", {}))
 
 
 @router.post("/generate-report")
 async def report_endpoint(payload: dict):
-    report = await generate_analysis_report(
+    return await generate_analysis_report(
         payload.get("image_analysis", {}),
         payload.get("reverse_search", {}),
         payload.get("public_footprint", {}),
         payload.get("consistency", {}),
         payload.get("evidence_score", {}),
     )
-    return report

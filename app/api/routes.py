@@ -11,6 +11,10 @@ from slowapi.util import get_remote_address
 
 from app.core.config import settings
 from app.core.security import validate_image, sanitize_filename
+from sqlalchemy.orm import Session
+from app.core.auth import get_current_user, check_daily_limit, increment_usage
+from app.db.database import get_db
+from app.db.models import User
 from app.services import (
     detect_ai_content,
     reverse_image_search,
@@ -38,6 +42,7 @@ async def _cleanup_file(path: str):
 
 
 def _compress_image(content: bytes, max_side: int = 1280, quality: int = 82) -> bytes:
+    """Shrink image to speed up external API uploads."""
     try:
         from io import BytesIO
         from PIL import Image
@@ -73,6 +78,8 @@ async def analyze_image(
     background_tasks: BackgroundTasks,
     file: Optional[UploadFile] = File(None),
     demo: Optional[bool] = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     use_demo = bool(demo) or settings.is_demo_mode or settings.FORCE_DEMO_MODE
 
@@ -101,6 +108,8 @@ async def analyze_image(
     if file is None or not file.filename:
         raise HTTPException(status_code=400, detail="Se requiere una imagen para el análisis.")
 
+    check_daily_limit(db, user)
+
     await validate_image(file)
     original_name = sanitize_filename(file.filename or "image.jpg")
     unique_name = f"{uuid.uuid4().hex}_{original_name}"
@@ -112,6 +121,7 @@ async def analyze_image(
     background_tasks.add_task(_cleanup_file, file_path)
 
     try:
+        # Parallel: AI detector + reverse search (biggest time save)
         image_analysis, reverse_result = await asyncio.gather(
             detect_ai_content(file_path, content),
             reverse_image_search(file_path, content),
@@ -138,6 +148,7 @@ async def analyze_image(
         consistency = compute_consistency(reverse_result, footprint)
         evidence = compute_evidence_score(image_analysis, reverse_result, footprint, consistency)
 
+        # Fast template report (skip Gemini wait — keeps us under Render free timeout)
         report = await generate_analysis_report(
             image_analysis, reverse_result, footprint, consistency, evidence
         )
@@ -166,7 +177,9 @@ async def analyze_image(
                     "message": "No se encontraron coincidencias indexadas. Esto no implica que la imagen sea original.",
                 })
 
-        return JSONResponse(content={
+        increment_usage(db, user.id)
+
+        result = {
             "is_demo": False,
             "image_analysis": image_analysis,
             "reverse_search": reverse_result,
@@ -175,7 +188,8 @@ async def analyze_image(
             "evidence_score": evidence,
             "summary": report.get("summary", ""),
             "warnings": warnings,
-        })
+        }
+        return JSONResponse(content=result)
 
     except HTTPException:
         raise
@@ -189,7 +203,11 @@ async def analyze_image(
 
 @router.post("/detect-ai")
 @limiter.limit(settings.RATE_LIMIT)
-async def detect_ai_only(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def detect_ai_only(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
     await validate_image(file)
     _ensure_upload_dir()
     unique_name = f"{uuid.uuid4().hex}_{sanitize_filename(file.filename or 'img.jpg')}"
@@ -198,6 +216,7 @@ async def detect_ai_only(request: Request, background_tasks: BackgroundTasks, fi
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
     background_tasks.add_task(_cleanup_file, file_path)
+
     if settings.is_demo_mode:
         return generate_demo_analysis(seed=unique_name)["image_analysis"]
     return await detect_ai_content(file_path, content)
@@ -205,7 +224,11 @@ async def detect_ai_only(request: Request, background_tasks: BackgroundTasks, fi
 
 @router.post("/reverse-search")
 @limiter.limit(settings.RATE_LIMIT)
-async def reverse_search_only(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def reverse_search_only(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+):
     await validate_image(file)
     _ensure_upload_dir()
     unique_name = f"{uuid.uuid4().hex}_{sanitize_filename(file.filename or 'img.jpg')}"
@@ -214,6 +237,7 @@ async def reverse_search_only(request: Request, background_tasks: BackgroundTask
     async with aiofiles.open(file_path, "wb") as f:
         await f.write(content)
     background_tasks.add_task(_cleanup_file, file_path)
+
     if settings.is_demo_mode:
         return generate_demo_analysis(seed=unique_name)["reverse_search"]
     return await reverse_image_search(file_path, content)

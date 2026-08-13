@@ -1,13 +1,12 @@
 from pydantic_settings import BaseSettings
 from typing import List
-import os
 
 
 class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     DEBUG: bool = True
-    CORS_ORIGINS: str = "http://localhost:5173,http://127.0.0.1:5173"
+    CORS_ORIGINS: str = "*"
 
     MAX_UPLOAD_SIZE_MB: int = 10
     UPLOAD_DIR: str = "./uploads"
@@ -23,6 +22,12 @@ class Settings(BaseSettings):
 
     RATE_LIMIT: str = "20/minute"
 
+    # Auth
+    JWT_SECRET: str = "change-me-in-production-traceid-secret"
+    JWT_EXPIRE_HOURS: int = 72
+    DAILY_SEARCH_LIMIT: int = 6
+    DATABASE_URL: str = "sqlite:///./traceid.db"
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
@@ -30,8 +35,7 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> List[str]:
-        origins = [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
-        # Allow * for simple deploys (Netlify + Render)
+        origins = [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
         if "*" in origins:
             return ["*"]
         return origins
@@ -44,8 +48,6 @@ class Settings(BaseSettings):
     def is_demo_mode(self) -> bool:
         if self.FORCE_DEMO_MODE:
             return True
-        # Real mode if at least one analysis API is configured
-        # (Gemini alone is not enough for full real analysis)
         has_detector = bool(self.AI_DETECTOR_API_KEY)
         has_reverse = bool(self.REVERSE_SEARCH_API_KEY)
         return not (has_detector or has_reverse)
